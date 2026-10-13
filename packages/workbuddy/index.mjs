@@ -81,6 +81,22 @@ const SITES = {
     // take them (see textOnly)
     noImages: /^glm-/,
   },
+  // the enterprise build: a server the enterprise runs itself, its address
+  // given at sign-in (each account carries its own endpoint; the site's own
+  // is empty). An experiment: WorkBuddy's own client headers, everywhere —
+  // browserSignIn's flow and sign/renew/meter as they stand — against that
+  // server, only the address differing. Its models are read from its own
+  // /v3/config when it serves one, else the China build's list.
+  "workbuddy-enterprise": {
+    id: "workbuddy-enterprise",
+    name: "WorkBuddy Enterprise",
+    endpoint: "",
+    authID: "workbuddy-desktop",
+    platform: "VSCode",
+    ai: false,
+    models: CN_MODELS,
+    selfHosted: true,
+  },
 }
 
 // textOnly says whether site drops the images sent to model, whatever its
@@ -144,7 +160,23 @@ async function call(site, method, path, headers = {}, body) {
 }
 
 function domainOf(site, a) {
+  // a self-hosted account is named by its own server (the site's endpoint
+  // is empty, so the fallback below couldn't be read)
+  if (a?.selfHosted && typeof a.endpoint === "string") {
+    try {
+      return new URL(a.endpoint).host
+    } catch {}
+  }
   return a.domain || new URL(api(site)).host
+}
+
+// siteFor is the site a's requests go to: a self-hosted account's own
+// server in place of the site's fixed one.
+function siteFor(site, a) {
+  if (a?.selfHosted && typeof a.endpoint === "string" && a.endpoint.trim()) {
+    return { ...site, endpoint: a.endpoint.trim().replace(/\/+$/, "") }
+  }
+  return site
 }
 
 // merge takes a token WorkBuddy gave (sign-in or refresh) into the
@@ -186,7 +218,7 @@ function renew(site, a, save) {
   let r = renewing.get(key)
   if (!r) {
     r = (async () => {
-      const got = await call(site, "POST", "/v2/plugin/auth/token/refresh", {
+      const got = await call(siteFor(site, a), "POST", "/v2/plugin/auth/token/refresh", {
         "X-Refresh-Token": a.refresh,
         "X-Auth-Refresh-Source": "plugin",
         "X-Domain": domainOf(site, a),
@@ -842,7 +874,10 @@ async function poll(site, path, headers, retry, deadline) {
   }
 }
 
-async function browserSignIn(site) {
+// browserSignIn signs in in the browser as WorkBuddy's desktop app does.
+// extra is what the account keeps besides the token — the enterprise
+// sign-in's server address and enterprise id; none for the builds above.
+async function browserSignIn(site, extra) {
   const state = await call(site, "POST", `/v2/plugin/auth/state?platform=${encodeURIComponent(site.platform)}`, {
     "X-No-Authorization": "true",
     "X-No-User-Id": "true",
@@ -864,7 +899,7 @@ async function browserSignIn(site) {
         const q = encodeURIComponent(state.state)
         const token = await poll(site, `/v2/plugin/auth/token?state=${q}`, {}, [11217], deadline)
         if (!token.accessToken) return { type: "failed", error: `${site.name} sent back no token` }
-        let a = merge({}, token)
+        let a = merge({ ...extra }, token)
         const who = await poll(site, `/v2/plugin/login/account?state=${q}`, {
           Authorization: "Bearer " + a.access,
           "X-Domain": domainOf(site, a),
@@ -872,13 +907,27 @@ async function browserSignIn(site) {
           "X-No-Enterprise-Id": "true",
         }, [12151], deadline)
         a.uid = who.uid ?? ""
-        a.enterpriseId = await enterpriseOf(site, a, who)
+        a.enterpriseId ??= await enterpriseOf(site, a, who)
         return success(site, a, who.nickname || who.phoneNumber || who.uid)
       } catch (e) {
         return { type: "failed", error: e.message }
       }
     },
   }
+}
+
+// enterpriseSignIn signs in to an enterprise self-hosted server with the
+// official client's own everything — an experiment: whether a Cloud-Hosted
+// server takes WorkBuddy's SaaS client. The server's address and the
+// enterprise id are asked for first; the flow above then runs against that
+// server, its address kept by the account, so its chats, models, refresh
+// and usage go there too.
+async function enterpriseSignIn(site, inputs) {
+  const endpoint = typeof inputs?.endpoint === "string" ? inputs.endpoint.trim().replace(/\/+$/, "") : ""
+  const enterpriseId = typeof inputs?.enterpriseId === "string" ? inputs.enterpriseId.trim() : ""
+  if (!/^https:\/\/\S+$/.test(endpoint)) throw new Error(`${site.name}: the server address must be an https:// URL`)
+  if (!enterpriseId) throw new Error(`${site.name}: an enterprise id is required`)
+  return browserSignIn({ ...site, endpoint }, { selfHosted: true, endpoint, enterpriseId })
 }
 
 function success(site, a, name) {
@@ -893,6 +942,8 @@ function success(site, a, name) {
     ...(a.enterpriseId ? { enterpriseId: a.enterpriseId } : {}),
     ...(a.refreshExpiresAt ? { refreshExpiresAt: a.refreshExpiresAt } : {}),
     ...(a.tokenType ? { tokenType: a.tokenType } : {}),
+    // the self-hosted account's own server, that its requests go to
+    ...(a.selfHosted ? { selfHosted: true, endpoint: a.endpoint } : {}),
   }
 }
 
@@ -1005,7 +1056,7 @@ const statusText = (n) => STATUS_TEXT[n] || `HTTP ${n}`
 // meter asks the billing API as magpie's built-in did, its errors said
 // the same: WorkBuddy's message, else its code, else the HTTP status.
 async function meter(site, a, path, body = {}) {
-  const res = await fetch(site.endpoint + path, {
+  const res = await fetch(siteFor(site, a).endpoint + path, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "WorkBuddy/" + UA_VERSION,
       Authorization: "Bearer " + a.access, "X-User-Id": a.uid ?? "", "X-Domain": domainOf(site, a), "X-Product": "SaaS",
@@ -1212,11 +1263,11 @@ function freeCredits(c) {
 
 async function liveModels(site, a) {
   const headers = new Headers()
-  sign(site, a, headers)
+  sign(siteFor(site, a), a, headers)
   headers.set("User-Agent", `CLI/${APP_VERSION} WorkBuddy/${UA_VERSION}`)
   headers.set("X-Requested-With", "XMLHttpRequest")
   headers.set("Accept", "application/json")
-  const res = await fetch(site.endpoint + "/v3/config", { headers, signal: AbortSignal.timeout(15000) })
+  const res = await fetch(siteFor(site, a).endpoint + "/v3/config", { headers, signal: AbortSignal.timeout(15000) })
   const env = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(`${site.name}'s config: HTTP ${res.status}`)
   if (env.code) throw new Error(`${site.name}'s config: ${env.msg} (${env.code})`)
@@ -1270,7 +1321,9 @@ function makePlugin(site) {
       const p = config.provider[site.id]
       p.name ??= site.name
       p.npm ??= NPM
-      p.api ??= api(site)
+      // a self-hosted site has no fixed server: each account's own is the
+      // loader's baseURL
+      if (site.endpoint) p.api ??= api(site)
       p.models = { ...configModels(site), ...(p.models ?? {}) }
     },
     // the conversation's id, which the chats below carry to WorkBuddy:
@@ -1309,7 +1362,8 @@ function makePlugin(site) {
         const auth = await getAuth()
         if (auth?.type !== "oauth") return {}
         return {
-          baseURL: api(site),
+          // a self-hosted account's chats go to its own server
+          baseURL: api(siteFor(site, auth)),
           apiKey: "",
           async fetch(input, init) {
             let a = await getAuth()
@@ -1341,6 +1395,15 @@ function makePlugin(site) {
         if (auth?.type !== "oauth" || !(auth.access || auth.source)) return { error: "not signed in", signIn: "kept" }
         try {
           const a = await current(site, client, auth)
+          // a self-hosted account's credits are the enterprise meter's —
+          // its server serves no SaaS summary — asked with the uid and
+          // the enterprise named, as its own client asks them. The meter
+          // has no /v2 prefix, on either server
+          if (a.selfHosted) {
+            const ent = enterpriseUsageOf(await meter(site, a, "/billing/meter/get-enterprise-user-usage", { uid: a.uid, enterpriseId: a.enterpriseId }))
+            if (ent) return { plan: auth.plan || "Enterprise", windows: [ent], signIn: "kept" }
+            return { error: `${site.name} told no credits`, signIn: "kept" }
+          }
           // the meter has no /v2 prefix, on either site
           const sum = await meter(site, a, "/billing/meter/get-user-resource-summary")
           const out = usageOf(sum, auth.plan)
@@ -1368,18 +1431,41 @@ function makePlugin(site) {
           return { error: e?.message ?? String(e), signIn: "kept" }
         }
       },
-      methods: [
-        {
-          type: "oauth",
-          label: `${site.name} account (browser)`,
-          authorize: () => browserSignIn(site),
-        },
-        {
-          type: "oauth",
-          label: `${site.name} desktop's sign-in`,
-          authorize: async () => desktopSignIn(site),
-        },
-      ],
+      methods: site.selfHosted
+        ? [
+            {
+              type: "oauth",
+              label: `${site.name} account (self-hosted)`,
+              prompts: [
+                {
+                  type: "text",
+                  key: "endpoint",
+                  message: `Your enterprise's ${site.name} server address`,
+                  placeholder: "https://codebuddy.example.com",
+                  validate: (v) => (/^https:\/\/\S+$/.test(String(v ?? "").trim()) ? undefined : "An https:// server address"),
+                },
+                {
+                  type: "text",
+                  key: "enterpriseId",
+                  message: "Enterprise ID",
+                  validate: (v) => (String(v ?? "").trim() ? undefined : "Required"),
+                },
+              ],
+              authorize: (inputs) => enterpriseSignIn(site, inputs),
+            },
+          ]
+        : [
+            {
+              type: "oauth",
+              label: `${site.name} account (browser)`,
+              authorize: () => browserSignIn(site),
+            },
+            {
+              type: "oauth",
+              label: `${site.name} desktop's sign-in`,
+              authorize: async () => desktopSignIn(site),
+            },
+          ],
     },
   })
 }
@@ -1466,6 +1552,7 @@ async function explained(res) {
 
 export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
+export const WorkBuddyEnterpriseAuthPlugin = makePlugin(SITES["workbuddy-enterprise"])
 
 // for tests
-export const _internal = { enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf }
+export const _internal = { enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, siteFor, enterpriseSignIn }

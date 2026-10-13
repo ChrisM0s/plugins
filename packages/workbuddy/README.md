@@ -1,15 +1,18 @@
 # @magpie-community/opencode-workbuddy-auth
 
 Signs in to the plans of WorkBuddy, Tencent's desktop agent from CodeBuddy.
-It has one provider for each of WorkBuddy's two builds:
+It has one provider for each of WorkBuddy's two builds, and one for the
+enterprise build a company runs itself:
 
 | Provider id | Build | API |
 |---|---|---|
 | `workbuddy` | WorkBuddy, the China build (CodeBuddy plan) | `https://copilot.tencent.com/v2` |
 | `workbuddy-ai` | WorkBuddy AI, the international build | `https://www.workbuddy.ai/v2` |
+| `workbuddy-enterprise` | WorkBuddy Enterprise, the self-hosted (Cloud-Hosted) build | your own server's `/v2` |
 
-The package exports `WorkBuddyAuthPlugin` (`workbuddy`) and
-`WorkBuddyAIAuthPlugin` (`workbuddy-ai`).
+The package exports `WorkBuddyAuthPlugin` (`workbuddy`),
+`WorkBuddyAIAuthPlugin` (`workbuddy-ai`) and
+`WorkBuddyEnterpriseAuthPlugin` (`workbuddy-enterprise`).
 
 ## Signing in
 
@@ -51,6 +54,32 @@ app's file. Every request then carries `X-Enterprise-Id` and `X-Tenant-Id`,
 as WorkBuddy's own client sends them; without them WorkBuddy answers as the
 personal account, with the personal plan's models. A browser sign-in made
 before 0.1.13 has no enterprise id kept: sign in again.
+
+## The enterprise (self-hosted) build
+
+`workbuddy-enterprise` signs in to a WorkBuddy Enterprise server the
+company runs itself (WorkBuddy's Cloud-Hosted build). Its one sign-in asks
+for two things first:
+
+- the server's address, an `https://` URL (`https://codebuddy.example.com`);
+- the enterprise ID.
+
+From there everything is WorkBuddy's own client, wholesale: the browser
+sign-in of the builds above — the same state, token and account calls,
+the login page opened with the same version and session id — runs against
+that server (its platform named `VSCode`, as CodeBuddy's client names it),
+and every later request — chats, models, the token refresh, the usage
+card — goes there with the headers the official builds send, unchanged
+(tested against a real Cloud-Hosted server: it takes WorkBuddy's own
+client). The account keeps the server's address, so `X-Domain` names it.
+
+The usage card asks the enterprise meter
+(`/billing/meter/get-enterprise-user-usage`, with the uid and the
+enterprise named in the body) — the one WorkBuddy's usage page reads for a
+team account, the same answer its own fields give (`credit`, `limitNum`,
+the cycle's times); a server that serves none shows an error there and
+nothing else is affected. The models are the server's `/v3/config` when it
+serves one, else the China build's list.
 
 Desktop's sign-in is refreshed only when the app hasn't refreshed it
 itself, and the new token is kept in memory, never written back, as magpie's
