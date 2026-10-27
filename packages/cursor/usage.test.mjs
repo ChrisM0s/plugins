@@ -307,3 +307,21 @@ test("no on-demand allowed, none set or not known: the pools are the allowance, 
   ]
   for (const [i, [period, hard]] of cases.entries()) expect([i, shape((await onDemand(period, hard)).u)]).toEqual([i, before])
 })
+
+// magpie #2213 (Morganwan90): the panel draws an account's first three
+// windows, and an On-demand with no limit (a dollar figure on a ring that
+// never fills) pushed Grok Bot to the fourth. One with a limit is what can
+// stop the account, and keeps its place ahead of Bot.
+const botOnDemand = (period, hard) =>
+  run(botAuth(), (url) => {
+    if (url === PLAN) return Response.json({})
+    if (url === BOT) return Response.json(paidBot)
+    if (url === HARD) return Response.json(hard)
+    return Response.json(period)
+  })
+test("Bot is among the first three windows ahead of an On-demand with no limit, behind one with a limit", async () => {
+  const open = (await botOnDemand({ ...spent, spendLimitUsage: { individualUsed: 900, limitType: "team" } }, { hardLimit: 2000, perUserMonthlyLimitDollars: 0 })).u
+  expect(open.windows.map((w) => w.name)).toEqual(["Cursor Models", "Other Models", "Grok Bot", "On-demand", "Total"])
+  const capped = (await botOnDemand({ ...spent, spendLimitUsage: { individualUsed: 500, limitType: "user" } }, { hardLimit: 20 })).u
+  expect(capped.windows.map((w) => w.name)).toEqual(["Cursor Models", "Other Models", "On-demand", "Grok Bot", "Total"])
+})

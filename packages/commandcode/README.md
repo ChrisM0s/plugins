@@ -48,6 +48,26 @@ When the plan isn't known yet and the Provider API refuses the key with
 then on (and saved so with it), and a chat completion is sent again to
 `/alpha/generate`.
 
+## Zero Data Retention
+
+[Zero Data Retention](https://commandcode.ai/docs/resources/zdr) sends
+requests only to upstreams that keep no prompts or replies. It is off
+until you turn it on, either way:
+
+- **In magpie**: turn on **Zero Data Retention** in the Command Code
+  provider's editor (magpie v0.1.1231 or later). The switch is read at
+  each request, so it needs no restart.
+- **Anywhere** (OpenCode too): set `CMD_ZDR=1` in the environment of the
+  process the plugin runs in, as for Command Code's CLI. Only `1` turns it
+  on.
+
+While it is on, every request for a reply carries `x-cmd-zdr: 1`, on the
+Provider API and on Go's `/alpha/generate` alike, as the CLI sends it with `CMD_ZDR=1`.
+ZDR requests usually cost more. A model with no ZDR upstream is refused,
+and the refusal reaches the agent as Command Code said it: on the Provider
+API a 422 with code `cmd_zdr_no_providers`, on Go a 400 whose type is
+`cmd_zdr_no_providers`. Turn the switch off, or pick another model.
+
 ## Models
 
 The `config` hook declares the default list:
@@ -91,6 +111,14 @@ that refusal reaches the agent.
 
   The Go models carry their reasoning levels, and a requested level is
   fitted to the nearest one the model has.
+
+Thinking can be turned off on the Provider API for DeepSeek V4 Pro, V4
+Flash, V4 Flash Vision (exp), V4.1 Flash and V4.1 Flash Fast. These models
+offer an off level (`none`), and the plugin sends it as Command Code's
+`reasoning_effort: "off"`. A client's own `"off"` is sent the same way. The
+other models, DeepSeek V4 Flash Fast and Kimi K3 among them, refuse `"off"`,
+so turning thinking off sends them no level. Go's `/alpha/generate` hasn't
+been tried with `"off"`, so it is sent no level there either.
 
 The `/models` list doesn't say which models take images. A model is marked
 as taking them when it is a Claude model, or when the default list or the

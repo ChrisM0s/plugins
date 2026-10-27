@@ -3,14 +3,21 @@
 // trial account on 2026-10-12, byte for byte (testdata/queued-10605.json).
 // The other codes are read as Qoder's own client reads them (QoderErrorCode
 // in Qoder.app's qoder-agent-sdk worker): only 105 is loginExpired there.
-import { afterEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { QoderAuthPlugin, _internal } from "./index.mjs"
 
 const QUEUED = readFileSync(new URL("./testdata/queued-10605.json", import.meta.url), "utf8").trim()
 
 const real = globalThis.fetch
-afterEach(() => (globalThis.fetch = real))
+// these are Qoder still queued once the wait is over: queue.test.mjs has
+// the wait itself
+const budget = _internal.QUEUE.budget
+beforeEach(() => (_internal.QUEUE.budget = 0))
+afterEach(() => {
+  globalThis.fetch = real
+  _internal.QUEUE.budget = budget
+})
 
 const API_CHAT = "https://api3.qoder.sh/v1/chat/completions"
 const ASK = { method: "POST", body: JSON.stringify({ model: "efficient", messages: [{ role: "user", content: "hi" }] }) }
@@ -77,4 +84,37 @@ test("Qoder's other codes on a 403 aren't a lapsed sign-in either; 105 and no co
     expect(f(code, "no")).toEqual({ status: 400, message: `Qoder refused the request (${code}): no`, signIn: "" })
   expect(f("105", "login expired")).toEqual({ status: 401, message: "the sign-in lapsed — sign in again (Qoder said 403: login expired)" })
   expect(_internal.failure(403, "")).toEqual({ status: 401, message: "the sign-in lapsed — sign in again" })
+})
+
+test("a BOM in an SSE error body must not turn a resource limit into expired auth", async () => {
+ const { fetch, sets } = await chat(() => sse({headers:{},body:"\uFEFF"+QUEUED,statusCodeValue:403,statusCode:"FORBIDDEN"}))
+ expect(await busy(await fetch(API_CHAT,ASK))).toEqual(WANT)
+ expect(sets).toEqual([])
+})
+
+// #167 lists these outer message wrappers as additional ways a structured
+// busy response can still reach the sign-in fallback. They are synthetic
+// wrappers of the saved upstream queue fixture, not captured live bytes.
+for (const [label, outer] of [
+  ["message only", { message: QUEUED }],
+  ["null code", { code: null, message: QUEUED }],
+  ["HTTP code", { code: 403, message: QUEUED }],
+  ["empty queue", { queue: {}, message: QUEUED }],
+]) for (const stream of [false, true]) {
+  test(`a ${label} wrapper preserves the resource failure (SSE=${stream})`, async () => {
+    const { fetch, sets } = await chat(() => stream
+      ? sse({ headers: {}, body: JSON.stringify(outer), statusCodeValue: 403, statusCode: "FORBIDDEN" })
+      : new Response(JSON.stringify(outer), { status: 403, headers: { "Content-Type": "application/json" } }))
+    expect(await busy(await fetch(API_CHAT, ASK))).toEqual(WANT)
+    expect(sets).toEqual([])
+  })
+}
+
+test("an explicit authentication, credit or request code is not replaced by text inside it", () => {
+  for (const [code, status] of [["105", 401], ["110", 429], ["406", 400]]) {
+    expect(_internal.failure(403, JSON.stringify({ code, message: QUEUED })).status).toBe(status)
+  }
+  expect(_internal.failure(403, JSON.stringify({ message: '{"code":"10605"' })).status).toBe(401)
+  expect(_internal.failure(403, JSON.stringify({ message: '[{"code":"10605"}]' })).status).toBe(401)
+  expect(_internal.failure(403, JSON.stringify({ message: JSON.stringify({ code: "110", message: "credits" }) })).status).toBe(401)
 })

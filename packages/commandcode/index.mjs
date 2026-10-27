@@ -12,11 +12,18 @@
 // is only taken where the CLI itself asks, POST /alpha/generate, in the
 // CLI's own format (command-code 1.72.2), which the fetch here writes from
 // the chat completion OpenCode sends and turns back into one.
+//
+// Zero Data Retention (commandcode.ai/docs/resources/zdr) is asked for as
+// the CLI asks it: x-cmd-zdr: 1 on every request for a reply, the Provider
+// API's and /alpha/generate's alike (command-code's buildCommandAuthHeaders
+// on CMD_ZDR=1: 1.84.0's bundle, and 1.74.1 as captured). It is on when the user turns on the provider's "Zero Data
+// Retention" switch in magpie, or when CMD_ZDR is "1" in the environment,
+// as for the CLI.
 import { createServer, STATUS_CODES } from "node:http"
 import { randomBytes, randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 
 const ID = "commandcode-plan"
 const API = "https://api.commandcode.ai"
@@ -24,6 +31,11 @@ const STUDIO = "https://commandcode.ai"
 const BASE = API + "/provider/v1"
 const CLI_VERSION = "1.72.2"
 const MAX_TOKENS = 64000 // the CLI's max_tokens when none is asked
+// MAX_OUTPUT is the most max_tokens Command Code takes at /alpha/generate,
+// for any model: more is refused, the whole request with it ("Too big:
+// expected number to be <=200000 at params.max_tokens") — magpie's
+// CommandCodeMaxOutput
+const MAX_OUTPUT = 200_000
 const ORIGINS = ["https://commandcode.ai", "https://staging.commandcode.ai"]
 const SIGN_IN_TIMEOUT = 10 * 60 * 1000
 
@@ -33,6 +45,21 @@ const RESPONSES = "@ai-sdk/openai" // the Responses API, which magpie speaks to 
 
 // ---- models -------------------------------------------------------------------
 
+// THINK_OFF are the models the Provider API turns thinking off for at
+// reasoning_effort "off" (CHENJIAMIAN, magpie-community/plugins#334, on a
+// GOAT key: 0 reasoning tokens on each, where "none" is refused as no
+// option and thinking {"type":"disabled"} is ignored). Others, DeepSeek V4
+// Flash Fast and Kimi K3 among them, refuse "off" ("does not support
+// reasoning_effort \"off\""). Each is offered magpie's off level, none,
+// beside the levels magpie gave it before (DeepSeek's: low, high, max),
+// and none or "off" asked of it is sent as "off" (providerBody). Go's
+// /alpha/generate is not known to take "off": its levels stay the CLI's.
+const THINK_OFF = new Set([
+  "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash-vision-exp",
+  "deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash-fast",
+])
+const OFF_EFFORTS = ["none", "low", "high", "max"]
+
 // The plan's models when its list can't be asked: Claude on Messages, the
 // rest on chat completions. Pictures as models.dev has them (DeepSeek V4
 // and GLM-5.3 read text alone, so say nothing).
@@ -40,8 +67,8 @@ const MODELS = [
   { id: "claude-sonnet-5", name: "Claude Sonnet 5", context: 1_000_000, images: true },
   { id: "claude-opus-5-5", name: "Claude Opus 5.5", context: 1_000_000, images: true },
   { id: "gpt-6-sol", name: "GPT-6 Sol", context: 1_050_000, images: true },
-  { id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro", context: 1_000_000 },
-  { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", context: 1_000_000 },
+  { id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro", context: 1_000_000, efforts: OFF_EFFORTS },
+  { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", context: 1_000_000, efforts: OFF_EFFORTS },
   { id: "moonshotai/Kimi-K3", name: "Kimi K3", context: 1_000_000, images: true },
   { id: "zai-org/GLM-5.3", name: "GLM-5.3", context: 1_000_000 },
   { id: "MiniMaxAI/MiniMax-M3", name: "MiniMax M3", context: 1_000_000, images: true },
@@ -175,6 +202,19 @@ const GO_EFFORTS = Object.fromEntries(GO_MODELS.map((m) => [m.id, m.efforts ?? [
 
 const isClaude = (id) => /^claude-/i.test(id) || id.startsWith("anthropic/")
 
+// FREE are the models Command Code's CLI marks FREE in its picker (1.73.2:
+// badge:"free", "{name} is free and uses shared capacity"); its API's list
+// doesn't say so, and Space Bunny Alpha's and Pixel Canary's ids name
+// nothing free — magpie's cmdFree. Neither says a model is served at a
+// discount.
+const FREE = new Set([
+  "stealth/space-bunny-alpha", "stealth/pixel-canary",
+  "poolside/laguna-s-2.1-free", "inclusionai/ling-3.0-flash-free",
+  "inclusionai/ling-3.0-flash-sante:free", "inclusionai/ling-3.1-flash:free",
+  "MiniMaxAI/MiniMax-M3-Free", "minimax/minimax-m3-free",
+  "minimax/minimax-m2.7-free", "meituan/LongCat-2.0:free", "tencent/Hy3",
+])
+
 // configModel is a model as opencode.json's provider.models has it.
 function configModel(m) {
   const npm = m.npm ?? (isClaude(m.id) ? MESSAGES : CHAT)
@@ -220,14 +260,18 @@ function runtimeModel(m) {
     },
     release_date: "",
     variants: Object.fromEntries((m.efforts ?? []).map((e) => [e, { reasoningEffort: e }])),
+    // magpie's plugin host reads it; the CLI calls the model free
+    ...(FREE.has(m.id) ? { free: true } : {}),
   }
 }
 
 // liveModels is the Provider API's list, with the APIs each model is
 // served on (its Claude models on /messages alone, the open ones on
 // /chat/completions and /responses, some on /responses alone); the default list's names and
-// windows fill in what it leaves out. The list says nothing of pictures:
-// a model takes them as the default list or the CLI's table (GO_MODELS)
+// windows fill in what it leaves out. A model that turns thinking off
+// (THINK_OFF) has its levels, off among them; the list names no levels,
+// and magpie gives every other model its maker's. The list says nothing
+// of pictures: a model takes them as the default list or the CLI's table (GO_MODELS)
 // says, and every Claude model does; of any other nothing is said, and
 // magpie answers from models.dev.
 async function liveModels(key) {
@@ -254,6 +298,7 @@ async function liveModels(key) {
       context: Number.isFinite(ctx) && ctx > 0 ? ctx : k?.context ?? 0,
       images,
       npm,
+      ...(THINK_OFF.has(m.id) ? { efforts: OFF_EFFORTS } : {}),
     })
   }
   if (!out.length) throw new Error("models: an empty list")
@@ -270,7 +315,9 @@ async function liveModels(key) {
 // the plan's (open) is let every model, as the CLI lets it.
 async function goModels(open = false) {
   const url = BASE + "/models"
-  const res = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "magpie" }, signal: AbortSignal.timeout(8_000) })
+  // the CLI asks its catalog with accept alone, under Node's fetch, whose
+  // User-Agent is "node" (installModelCatalogManager)
+  const res = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "node" }, signal: AbortSignal.timeout(8_000) })
   const text = await res.text()
   // catalog.FetchURL's errors
   if (res.status !== 200) {
@@ -466,9 +513,15 @@ function limits(c) {
 // allowanceOf makes a credits reply into the plan's windows: the 5-hour
 // and weekly limits, and the dollars as one more, used of the CLI's pool
 // (the plan's month of credits, or what is left of it if more, and the
-// bought and free ones) as its /usage bar is. A reply with neither windows
-// nor a plan tells a balance: a key's money, not an allowance.
-function allowanceOf(c) {
+// bought and free ones) as its /usage bar is. The dollars, the plan's
+// whole allowance, go second, after the 5-hour window: magpie's account
+// line and menu bar show an account's first two windows, and with them
+// last the Credits bar was never there (01huadalang on Discord). A reply with neither windows
+// nor a plan tells a balance: a key's money, not an allowance. The month's
+// credits come back at until, the end of the plan's period
+// (billing/subscriptions' currentPeriodEnd), when it is known
+// (yetone/magpie#2454).
+function allowanceOf(c, until) {
   const out = { windows: limits(c) }
   const [, name, planMonthly] = planOf(c?.credits?.planId)
   if (name) out.plan = name
@@ -485,7 +538,7 @@ function allowanceOf(c) {
   }
   if (known && planMonthly > 0) {
     const pool = Math.max(planMonthly, monthly) + left - monthly
-    out.windows.push({ name: "Credits", used: Math.min(100, (100 * (pool - left)) / pool), display: money(pool - left) + " / " + money(pool) })
+    out.windows.splice(1, 0, { name: "Credits", used: Math.min(100, (100 * (pool - left)) / pool), display: money(pool - left) + " / " + money(pool), ...(until ? { resetsAt: until } : {}) })
   } else if (known && !out.windows.length) out.balance = money(left)
   return out
 }
@@ -559,7 +612,7 @@ async function usage(key, saved) {
     // is made of is the subscription's plan's
     const c = credits.c ?? {}
     extraSeen.set(key, hasExtra(c))
-    out = allowanceOf({ ...c, credits: { ...(c.credits ?? {}), planId: c.credits?.planId || sub?.id || "" } })
+    out = allowanceOf({ ...c, credits: { ...(c.credits ?? {}), planId: c.credits?.planId || sub?.id || "" } }, sub?.until)
   }
   if (sub) {
     out.plan = sub.plan
@@ -882,12 +935,16 @@ function generateBody(chat, place = {}) {
     messages,
     tools,
     system: system.join("\n\n"),
-    max_tokens: chat.max_completion_tokens || chat.max_tokens || MAX_TOKENS,
+    // within what Command Code takes: more is refused, the whole request
+    // with it
+    max_tokens: Math.min(chat.max_completion_tokens || chat.max_tokens || MAX_TOKENS, MAX_OUTPUT),
     stream: true,
   }
   if (typeof chat.temperature === "number") params.temperature = chat.temperature
+  // off ("none", or a client's "off") is not known to be taken here: it
+  // is sent as nothing, the model's own default
   const effort = chat.reasoning_effort
-  if (effort && effort !== "none") params.reasoning_effort = fitEffort(effort, GO_EFFORTS[chat.model] ?? [])
+  if (effort && effort !== "none" && effort !== "off") params.reasoning_effort = fitEffort(effort, GO_EFFORTS[chat.model] ?? [])
   const d = new Date()
   const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
   return {
@@ -910,16 +967,45 @@ function generateBody(chat, place = {}) {
   }
 }
 
-// generateHeaders are the CLI's own (buildCommandAuthHeaders).
-const generateHeaders = (key) => ({
+// ZDR is the header that asks for Zero Data Retention, and ZDR_OPTION the
+// provider's switch for it in magpie (auth.options, read through
+// input.magpie.option).
+const ZDR = "x-cmd-zdr"
+const ZDR_OPTION = "zdr"
+
+// zdrOn says whether requests ask for Zero Data Retention: magpie's switch
+// for it, read at each request so a change needs no restart, or CMD_ZDR
+// as the CLI reads it ("1" alone; isCmdZdrEnabled).
+function zdrOn(magpie) {
+  try {
+    if (magpie?.option?.(ID, ZDR_OPTION) === true) return true
+  } catch {}
+  return process.env.CMD_ZDR === "1"
+}
+
+// projectSlug is the CLI's x-project-slug for a working directory: its
+// last segment, "root" when it has none (getProjectDirName's slugify of
+// basename(cwd)); a Windows folder's too, as the CLI's win32 basename
+// splits it. A name a header can't carry (past Latin-1: the CLI's own
+// request fails there, Node refusing the header) goes percent-encoded.
+function projectSlug(dir) {
+  const name = basename(String(dir || homedir()).replaceAll("\\", "/")) || "root"
+  return /^[\x20-\x7e\xa0-\xff]*$/.test(name) ? name : encodeURIComponent(name)
+}
+
+// generateHeaders are the CLI's own (buildCommandAuthHeaders), with its
+// x-cmd-zdr: 1 when ZDR is on; the project slug is the working folder's
+// name, as the CLI's is.
+const generateHeaders = (key, zdr = false, place = {}) => ({
   "Content-Type": "application/json",
   "User-Agent": "cli",
   "x-command-code-version": CLI_VERSION,
   "x-cli-environment": "production",
-  "x-project-slug": "magpie",
+  "x-project-slug": projectSlug(place.dir),
   "x-taste-learning": "false",
   "x-session-id": session,
   Authorization: `Bearer ${key}`,
+  ...(zdr ? { [ZDR]: "1" } : {}),
 })
 
 // QUOTA_WORDS are magpie's quotaWords (internal/gateway/fallback.go): a
@@ -971,14 +1057,20 @@ function streamError(e) {
       if (j?.error?.message) msg = j.error.message
     } catch {}
   }
-  return failure(status || 500, msg)
+  const f = failure(status || 500, msg)
+  // a ZDR request for a model no upstream that keeps nothing serves: its
+  // type goes on with it, as the Provider API's 422 says it
+  // ({"type":"cmd_zdr_no_providers","code":"CMD_ZDR_NO_PROVIDERS",
+  // "statusCode":400} on /alpha/generate)
+  if (typeof e === "object" && (e?.type === "cmd_zdr_no_providers" || e?.code === "CMD_ZDR_NO_PROVIDERS")) f.type = "cmd_zdr_no_providers"
+  return f
 }
 
 // errorResponse is a failure as the built-in answered it, the account
 // kept: the built-in never marked a Command Code account lapsed, a 401 of
 // Command Code's among them.
-const errorResponse = ({ status, message }) =>
-  new Response(JSON.stringify({ error: { message, type: "commandcode_error", code: status } }), {
+const errorResponse = ({ status, message, type }) =>
+  new Response(JSON.stringify({ error: { message, type: type || "commandcode_error", code: status } }), {
     status,
     headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
   })
@@ -1087,10 +1179,10 @@ async function* events(body) {
 }
 
 // generate answers a chat completion through /alpha/generate.
-async function generate(key, chat, signal, place) {
+async function generate(key, chat, signal, place, zdr = false) {
   const res = await fetch(API + "/alpha/generate", {
     method: "POST",
-    headers: generateHeaders(key),
+    headers: generateHeaders(key, zdr, place),
     body: JSON.stringify(generateBody(chat, place)),
     signal,
   })
@@ -1162,11 +1254,24 @@ async function generate(key, chat, signal, place) {
   return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } })
 }
 
+// providerBody is the chat completion chat as the Provider API is sent it,
+// or undefined when it goes as it came: off, magpie's none or a client's
+// "off", is "off" for a model that turns thinking off (THINK_OFF), and
+// left out for any other, which refuses both "none" and "off" (#334).
+function providerBody(chat) {
+  const e = chat?.reasoning_effort
+  if (e !== "none" && e !== "off") return undefined
+  const out = { ...chat }
+  if (THINK_OFF.has(chat.model)) out.reasoning_effort = "off"
+  else delete out.reasoning_effort
+  return e === out.reasoning_effort ? undefined : JSON.stringify(out)
+}
+
 // ---- the plugin ---------------------------------------------------------------
 
-export const _internal = { subsSeen, extraSeen, waits, liveKey, failure, goModels, refuses, GO_MODELS, GO_REFUSED }
+export const _internal = { projectSlug, subsSeen, extraSeen, waits, liveKey, failure, goModels, refuses, GO_MODELS, GO_REFUSED, zdrOn }
 
-export async function CommandCodePlugin({ client } = {}) {
+export async function CommandCodePlugin({ client, magpie } = {}) {
   // isGo keeps a key as Go's, for its models and endpoint: in the
   // subscriptions seen, and saved with the key as usage saves the plan read
   async function isGo(key, auth) {
@@ -1199,6 +1304,11 @@ export async function CommandCodePlugin({ client } = {}) {
             headers.set("Authorization", `Bearer ${key}`)
             headers.set("x-api-key", key)
             const place = workPlace(headers)
+            // Zero Data Retention, as the CLI asks it; a 422
+            // cmd_zdr_no_providers (no upstream that keeps nothing serves
+            // the model) goes on to the agent as it came
+            const zdr = zdrOn(magpie)
+            if (zdr) headers.set(ZDR, "1")
             const chatting = /\/chat\/completions$/.test(new URL(url).pathname)
             let chat
             if (chatting) {
@@ -1208,11 +1318,14 @@ export async function CommandCodePlugin({ client } = {}) {
               } catch {
                 return errorResponse({ status: 400, message: "a request that isn't JSON" })
               }
-              if ((await planNow(key, saved)) === "Go") return kept(await generate(key, chat, init.signal, place))
+              if ((await planNow(key, saved)) === "Go") return kept(await generate(key, chat, init.signal, place, zdr))
             }
             // the Provider API's answer goes on as it came, the account
             // kept: the built-in neither marked one lapsed nor cleared it
-            const res = await fetch(input, { ...init, headers })
+            const body = chatting ? providerBody(chat) : undefined
+            const res = await (body === undefined
+              ? fetch(input, { ...init, headers })
+              : fetch(url, { ...init, method: init.method ?? (input instanceof Request ? input.method : "POST"), headers, body }))
             if (res.ok) return kept(res)
             // a Go key the plan wasn't known for (billing/subscriptions slow
             // or failing, nothing saved yet) is refused by the Provider API
@@ -1221,12 +1334,23 @@ export async function CommandCodePlugin({ client } = {}) {
             const text = await res.text()
             if (GO_NO_API.test(text)) {
               await isGo(key, (await getAuth()) ?? auth)
-              if (chatting) return kept(await generate(key, chat, init.signal, place))
+              if (chatting) return kept(await generate(key, chat, init.signal, place, zdr))
             }
             return kept(new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers }))
           },
         }
       },
+      // magpie's switches for the provider (#2038): shown in its editor,
+      // read with input.magpie.option at each request
+      options: [
+        {
+          key: ZDR_OPTION,
+          label: "Zero Data Retention",
+          description:
+            "Sends x-cmd-zdr: 1, as the CLI's CMD_ZDR=1 does: requests go only to upstreams that keep no prompts or replies. They usually cost more, and a model with no such upstream fails (422 cmd_zdr_no_providers).",
+          confirm: "ZDR requests usually cost more, and a model with no zero-data-retention upstream fails instead of falling back.",
+        },
+      ],
       methods: [
         { type: "oauth", label: "Command Code (browser)", authorize: browserSignIn },
         { type: "oauth", label: "Command Code CLI's sign-in", authorize: cliSignIn },

@@ -21,12 +21,47 @@ over Anthropic's Messages API. Provider id: `zcode`.
   - zcode.z.ai serves the Start Plan only to requests that look like the
     ZCode client's own, and refuses others with HTTP 405 "request has been
     blocked due to unusual activity". So a Start Plan request goes as
-    ZCode's does: ZCode's headers, ZCode's system prompt ahead of the
-    agent's, the day in a `<system-reminder>` turn before the agent's
+    ZCode's does: ZCode's headers, ZCode's three system blocks with the
+    agent's system prompt at the end of the third (a fourth block is
+    refused, #343), the day in a `<system-reminder>` turn before the agent's
     turns, and the sign-in's device id in `metadata.user_id`. GLM Coding
-    Plan and team requests go as the agent sent them.
+    Plan and team requests go as the agent sent them, but for that same
+    `metadata.user_id` when the agent sent none: ZCode puts it on every
+    request, and the plan's endpoint keeps a prompt cache on the machine it
+    picks by it, so without it the cache is mostly missed (#387). An
+    account known only by its key gets a device id made from the key, the
+    same on every start. Every request also carries the `x-session-id`
+    header below. zcode.z.ai also
+    answers 405 code 3012 to every request of an account its risk control
+    blocked, ZCode's own app's included (plugins#348). That answer comes
+    back as ZCode's words, then "ZCode's risk control blocked this account
+    for unusual activity (code 3012); …", which magpie reads as the account
+    restricted: it rests, and the group's other providers are used. Only
+    ZCode support lifts such a block. A block page from ZCode's edge
+    firewall says this network's address was blocked instead.
   - The Start Plan's token can't be refreshed. When it runs out, sign in
     again.
+  - Every request, on any plan, names its conversation in `x-session-id`,
+    as ZCode does: a bare UUID, the same on each turn. BigModel's prompt
+    cache follows it: without it a long conversation's turns hit the cache
+    about one time in twenty, with it nearly every turn (#387). The
+    agent's own session id (magpie tells it to the plugin) goes as it is
+    when it is a UUID, else as a UUID made from it, so the vendor sees
+    only ZCode's format; with none, a UUID made from the device. The same
+    id is `metadata.user_id`'s `session_id`, as in ZCode's requests.
+- **ZCode: a team's GLM Coding Plan**
+  - For an account with a plan of its own and a seat on a team's plan
+    (#285). The sign-ins above take the account's own plan, as ZCode does
+    by default; this one asks which site, signs in the same way, and
+    takes the team seat's `zcode-team-api-key`, as ZCode does when its
+    plan picker is switched to the team's plan.
+  - It is kept as an account of its own, named `<email> (team)`, beside
+    the account's own plan, so both can be used.
+  - With no seat on a team's plan, it says so and signs in to nothing.
+  - The same ZCode session also reads the person's gift plans. Their
+    `<model>-Trial` entries and gift buckets appear beside the team's
+    models and allowance. Plain models spend the team plan; trial entries
+    spend the personal gift, with no fallback to the team on refusal.
 - **ZCode app's sign-in**
   - Uses the account the ZCode app on this computer is signed in to. For
     every request it reads ZCode's own credentials (`~/.zcode/v2`), so it
@@ -38,6 +73,13 @@ over Anthropic's Messages API. Provider id: `zcode`.
     another's credentials: to use both, add the app's sign-in once for each.
 - **GLM Coding Plan API key**
   - Paste a key (`<id>.<secret>`) and say which site it is from.
+  - A key reaches the GLM Coding Plan alone. ZCode's gift plans (the
+    Start Plan, ZCode 1024 Dev Day) are served to ZCode's own session,
+    which a key doesn't carry: for an account with only a gift plan, the
+    card and each refused request (1113) say to sign in with ZCode
+    instead. For an account with a GLM Coding Plan, the card says the
+    gift plans' `-Trial` models need ZCode's sign-in, since a key lists
+    none of them.
 
 ## Where the sign-in is kept
 
@@ -55,7 +97,11 @@ the ZCode app's sign-in (`refresh` then holds `"source": "zcode"`).
 ## How requests are routed
 
 Before each request, the plugin checks which plan the account is on, and
-asks again every 10 minutes:
+asks again every 10 minutes, and with every read of the usage card, so a
+plan bought, a gift claimed or a plan lapsed reaches the requests when the
+card shows it. A key whose plan list once reads no plan after reading one
+is asked again after a minute, and a Start Plan refusal on such a key reads
+the plans again on the next request:
 
 - If the key's account has a GLM Coding Plan
   (`/api/biz/subscription/list`), its requests go to that plan. A model
@@ -82,9 +128,35 @@ coding plan; when the gift answers a trial entry with a quota error
 "exceed quota limit", which it can answer inside an HTTP 200) that too
 becomes a 429 and keeps the entry off for a minute. Any other gift
 answer (its 405, its 401, its 5xx) goes on as it came: the user picked
-the gift, so the coding plan is not spent behind their back. Every 429
-counts as spent, Z.ai's 1302/1303 rate limits among them. A stream's
-body is never read or buffered on the way.
+the gift, so the coding plan is not spent behind their back. Every other
+429 counts as spent — Z.ai's 1302/1303 rate limits among them — while the
+plan's own in-flight cap (3008/3009) does not: such a request is asked
+again instead (see [A few at once](#a-few-at-once)). A stream's body is
+never read or buffered on the way.
+
+## A few at once
+
+A plan serves one account a few requests at a time; past that, ZCode
+answers 429 with code 3008 "user concurrency limit exceeded", or 3009
+"model concurrency limit exceeded". magpie funnels every agent's and every
+session's requests of one computer through this one plugin process, so
+magpie's own queue spaces an account's requests by the number this plugin
+declares — `maxConcurrency` on the auth hook, and `magpie.maxConcurrency`
+in its `package.json`, both three. A request the vendor refuses anyway
+waits a moment (a quarter of a second, then longer — about ten seconds of
+waits in all) and asks again, the same request byte for byte. A cap that
+outlasts the waits goes on as a 429, ZCode's words followed by what they
+mean, so the agent reads why. magpie still reads it as a rate limit: the
+account rests a minute and the request goes to the next member of its
+routing group, as it did before.
+
+Three is a default, not a cap the plugin enforces. A plan's real cap
+follows its tier — Z.ai serves a Max plan more at once than a Pro, and a
+Lite fewer — and is higher off-peak
+([Z.ai's usage policy](https://docs.z.ai/devpack/usage-policy)), so a
+number written into the plugin would hold a Max account to a Lite one's
+with no way to raise it. A user who knows their plan's cap sets it on the
+account or the provider in magpie, and magpie's queue follows that.
 
 ## The usage card
 
@@ -95,6 +167,15 @@ that fails leaves just the coding card — magpie hides a card's windows
 behind an error, so a gift hiccup must not black out a working Coding
 Plan. A gift that goes out of date while requests use it simply stops
 showing.
+
+**Resets.** A GLM Coding Plan of the account's own, and a team seat,
+show the resets the vendor's usage page lists
+(`/api/biz/customer-package-reset/list`, `targetType=PERSONAL` with the
+plan's key, `TEAM` with the team's sign-in): how many of the five hours
+and of the week are still available, and when each runs out, soonest
+first. A team's are marked a team's. They are only read; a reset is
+spent on the vendor's own page. A list that can't be read, or has none
+left, shows no count.
 
 **Gift plans ZCode holds but has not granted.** ZCode hands out one-off
 trust-build / gift plans (a day's ZCode Trust Build, say) that are not
@@ -110,12 +191,21 @@ that fails, or lists nothing, adds no line at all, and a card that is an
 error keeps its error. Claim the plan in the ZCode app (open it once);
 the next read shows it as an ordinary gift bucket.
 
+**No ZCode session.** A card read with a key, or with a sign-in whose
+ZCode session has run out (it can't be renewed), sets aside a line named
+"ZCode gift plans (-Trial models) need ZCode's sign-in", with why in its
+display: such an account reads no gift and lists no `-Trial` entries.
+Sign in again with ZCode to get them back. A gift read that fails
+otherwise is asked again a minute later, not ten.
+
 ## Models
 
 The models are the ones ZCode offers for the account's plan. They come
 from ZCode's provider config: the release zcode.z.ai names, or an
 installed ZCode's copy if that one is newer. The list is kept for 10
-minutes. When the config can't be read, the plugin falls back to this list:
+minutes. When the config can't be read, the plugin falls back to this list
+(and magpie keeps the list it was told last, unless the account's gift
+plans add `-Trial` entries, which are told as read):
 
 | Model | Context | Output | Efforts |
 |---|---|---|---|

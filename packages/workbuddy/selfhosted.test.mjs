@@ -108,7 +108,7 @@ test("the enterprise plugin offers one sign-in; the official builds keep theirs"
   expect(m.prompts[1].validate("ent-1")).toBeUndefined()
   expect(m.prompts[1].validate("  ")).toBeTruthy()
   const official = await WorkBuddyAuthPlugin({ client: {} })
-  expect(official.auth.methods.length).toBe(2)
+  expect(official.auth.methods.length).toBe(3)
 })
 
 test("a self-hosted account's chats go to its server with the official headers", async () => {

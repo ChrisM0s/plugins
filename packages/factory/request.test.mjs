@@ -1541,6 +1541,17 @@ test("a skill list sent alone as a system message has the update-config line ada
   }
 })
 
+test("recognizes the update-config entry with or without the invoking slash (#72)", async () => {
+  const { l, seen } = await loaded()
+  const slashed = bareConfigSkill.replace("- update-config:", "- /update-config:")
+  const want = (text) => text.replace("not Claude", "not the assistant")
+  for (const text of [bareConfigSkill, slashed]) {
+    const request = { model: "factory/claude-opus-5-5", max_tokens: 32, messages: [{ role: "user", content: "hi" }, { role: "system", content: text }] }
+    await l.fetch(url, { method: "POST", body: JSON.stringify(request) })
+    expect(JSON.parse(seen.at(-1).body).messages[1].content).toBe(want(text))
+  }
+})
+
 test("only a system message that is a skill list is adapted (#72)", async () => {
   const { l, seen } = await loaded()
   for (const [role, text] of [
@@ -1571,4 +1582,120 @@ test("a streamed request goes without context_management, an unstreamed one keep
   expect(JSON.parse(seen.at(-1).body)).toEqual({ ...rest, system: [{ type: "text", text: droid }] })
   await l.fetch(url, { method: "POST", body: JSON.stringify({ ...request, stream: false }) })
   expect(JSON.parse(seen.at(-1).body).context_management).toEqual(request.context_management)
+})
+
+// Claude Code 2.1.302's built-in claude-code-guide agent builds its own
+// system prompt and appends a "# User's Current Configuration" section to it,
+// rendering each custom skill as "- /<name>: <description>". The system
+// message that carries the same list elsewhere has no slash. Both spellings
+// hold the same update-config description, whose self-reference Factory
+// refuses: the agent's first request came back 403 "Factory: Forbidden" until
+// that one phrase was reworded. The description below is byte-for-byte the one
+// the agent sent, and the section is the template the CLI builds it from.
+const configDescription =
+  'Use this skill to configure the Claude Code harness via settings.json. Automated behaviors ("from now on when X", "each time X", "whenever X", "before/after X") require hooks configured in settings.json - the harness executes these, not Claude, so memory/preferences cannot fulfill them. Also use for: permissions ("allow X", "add permission", "move permission to"), env vars ("set X=Y"), hook troubleshooting, or any changes to settings.json/settings.local.json. Examples: "allow npm commands", "add bq permission to global settings", "move permission to user settings", "set DEBUG=true", "when claude stops show X". For simple settings like theme/model, suggest the /config command.'
+const guidePrompt = [
+  "You are the Claude guide agent. Your primary responsibility is helping users understand and use Claude Code, the Claude Agent SDK, and the Claude API effectively.",
+  "",
+  "---",
+  "",
+  "# User's Current Configuration",
+  "",
+  "The user has the following custom setup in their environment:",
+  "",
+  "**Available custom skills in this project:**",
+  "- /update-config: " + configDescription,
+  "- /custom: Keep not Claude in this user's description.",
+  "",
+  "**Configured MCP servers:**",
+  "- lcu",
+  "",
+  "When answering questions, consider these configured features and proactively suggest them when relevant.",
+].join("\n")
+
+test("adapts the update-config self-reference in a system prompt's configuration section", async () => {
+  const { l, seen } = await loaded()
+  // The entry is named the same either way, so both spellings adapt wherever
+  // the list arrives; only the slash rendering is what Claude Code sends today.
+  for (const text of [guidePrompt, guidePrompt.replace("- /update-config:", "- update-config:")]) {
+    const system = [
+      { type: "text", text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." },
+      { type: "text", text, cache_control: { type: "ephemeral" } },
+    ]
+    const body = JSON.stringify({ model: "factory/claude-haiku-5-5", max_tokens: 32, stream: true, system, messages: [{ role: "user", content: "hi" }] })
+    await l.fetch(url, { method: "POST", body })
+    const sent = JSON.parse(seen.at(-1).body)
+    expect(sent.system).toEqual([
+      { type: "text", text: droid },
+      { ...system[1], text: text.replace(configDescription, configDescription.replace("not Claude", "not the assistant")) },
+    ])
+    expect(JSON.stringify(sent)).not.toContain("not Claude, so")
+  }
+})
+
+test("leaves the refused sentence in a system prompt outside the update-config entry alone", async () => {
+  const { l, seen } = await loaded()
+  const sentence = "the harness executes these, not Claude, so memory/preferences cannot fulfill them."
+  const system = [
+    { type: "text", text: droid },
+    { type: "text", text: [
+      "You are the Claude guide agent.",
+      "",
+      "The user's own skill description reads: " + sentence,
+      "",
+      "**Available custom skills in this project:**",
+      "- /custom-config: " + sentence,
+      "- /update-config-help: " + sentence,
+    ].join("\n") },
+  ]
+  const body = JSON.stringify({ model: "factory/claude-haiku-5-5", max_tokens: 32, system, messages: [{ role: "user", content: "hi" }] })
+  await l.fetch(url, { method: "POST", body })
+  expect(seen[0].body).toBe(body)
+})
+
+test("adapting a system prompt's configuration section is idempotent", async () => {
+  const { l, seen } = await loaded()
+  const body = JSON.stringify({ model: "factory/claude-haiku-5-5", max_tokens: 32, system: [{ type: "text", text: guidePrompt }], messages: [{ role: "user", content: "hi" }] })
+  await l.fetch(url, { method: "POST", body })
+  expect(seen[0].body).not.toBe(body)
+  expect(JSON.parse(seen[0].body).system.at(-1).text).toContain("not the assistant, so memory/preferences")
+  await l.fetch(url, { method: "POST", body: seen[0].body })
+  expect(seen[1].body).toBe(seen[0].body)
+})
+
+// magpie-community/plugins#302, the reporter's offline repro: the billing
+// header joined with the instructions after it, in one block or a string
+// system, loses only its own line.
+test("a billing header joined with instructions loses only its own line (#302)", async () => {
+  const { l, seen } = await loaded()
+  const billing = "x-anthropic-billing-header: cc_version=2.1.300; cc_entrypoint=cli;"
+  const policy = "Preserve this task instruction. SYSTEM_POLICY_SENTINEL"
+  const cases = [
+    ["joined block", [{ type: "text", text: billing + "\n" + policy, cache_control: { type: "ephemeral" } }],
+      [{ type: "text", text: droid }, { type: "text", text: policy, cache_control: { type: "ephemeral" } }]],
+    ["joined string", billing + "\n" + policy, [{ type: "text", text: droid }, { type: "text", text: policy }]],
+    ["separate blocks", [{ type: "text", text: billing }, { type: "text", text: policy }], [{ type: "text", text: droid }, { type: "text", text: policy }]],
+    ["billing only", [{ type: "text", text: billing }], [{ type: "text", text: droid }]],
+    ["billing and a blank line", billing + "\n\n", [{ type: "text", text: droid }]],
+  ]
+  for (const [name, system, want] of cases) {
+    const messages = [{ role: "user", content: "Hello" }]
+    for (const endpoint of [url, url + "/count_tokens"]) {
+      await l.fetch(endpoint, { method: "POST", body: JSON.stringify({ model: "claude-sonnet-5", system, messages, max_tokens: 64 }) })
+      const sent = JSON.parse(seen.at(-1).body)
+      expect([name, sent.system]).toEqual([name, want])
+      expect(sent.messages).toEqual(messages)
+      expect(sent.max_tokens).toBe(64)
+      // what was sent is what goes again unchanged
+      const once = seen.at(-1).body
+      await l.fetch(endpoint, { method: "POST", body: once })
+      expect(seen.at(-1).body).toBe(once)
+    }
+  }
+  // the identity after the header is still made Droid's
+  await l.fetch(url, { method: "POST", body: JSON.stringify({ model: "claude-sonnet-5", system: billing + "\nYou are Claude Code, Anthropic's official CLI for Claude.\n" + policy, messages: [{ role: "user", content: "Hello" }] }) })
+  const sent = JSON.parse(seen.at(-1).body).system
+  expect(JSON.stringify(sent)).not.toContain("x-anthropic-billing-header")
+  expect(sent[0].text).toStartWith(droid)
+  expect(JSON.stringify(sent)).toContain("SYSTEM_POLICY_SENTINEL")
 })

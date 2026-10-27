@@ -1,11 +1,14 @@
 // A CPA xAI account file is translated into the sign-in Grok Build keeps in
 // a home of the plugin's own. The file is only read: a CPA refresh token
 // rotates, so the account is migrated, not shared.
+import { noRealGrok } from "./nocli.mjs"
 import { afterAll, afterEach, expect, test } from "bun:test"
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { basename, delimiter, dirname, join } from "node:path"
 import { GrokAuthPlugin } from "./index.mjs"
+
+noRealGrok()
 
 const CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 const SCOPE = `https://auth.x.ai::${CLIENT_ID}`
@@ -148,6 +151,8 @@ test("what isn't an enabled CPA xAI OAuth account is refused, with no home made"
 test("no Grok Build to refresh the sign-in with is refused first", async () => {
   sandbox({ exe: false })
   await expect(importFrom(cpaFile())).rejects.toThrow("install Grok Build first")
+  // one put in a folder of the user's choosing (magpie in Docker) is named too
+  await expect(importFrom(cpaFile())).rejects.toThrow("set GROK_BIN_DIR to the folder holding its grok binary")
 })
 
 test("a token that has already ended is still taken, its renewal left to the CLI", async () => {
