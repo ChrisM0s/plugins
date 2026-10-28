@@ -122,8 +122,11 @@ test("a self-hosted account's chats go to its server with the official headers",
   expect(chat.headers.get("Authorization")).toBe("Bearer a")
   expect(chat.headers.get("X-User-Id")).toBe("u")
   expect(chat.headers.get("X-Domain")).toBe("codebuddy.example.com")
-  // WorkBuddy's own client headers, as the official builds' chats carry
-  expect(chat.headers.get("X-Product")).toBe("SaaS")
+  // WorkBuddy's own client headers, as the official builds' chats carry —
+  // X-Product the enterprise's own client sends: "Cloud-Hosted", which is
+  // also what its /v3/config answers its models to ("SaaS" there answers
+  // enterpriseId and productFeatures alone)
+  expect(chat.headers.get("X-Product")).toBe("Cloud-Hosted")
   expect(chat.headers.get("X-IDE-Type")).toBe("WorkBuddy")
   expect(chat.headers.get("X-IDE-Name")).toBe("WorkBuddy")
   expect(chat.headers.get("User-Agent")).toBe("WorkBuddy/5.5.6")
@@ -169,7 +172,7 @@ test("a self-hosted account's usage is the enterprise meter's, at its server", a
   expect(ent.url.origin).toBe(SERVER)
   expect(JSON.parse(ent.body)).toEqual({ uid: "u", enterpriseId: "ent-1" })
   expect(ent.headers.get("X-Enterprise-Id")).toBe("ent-1")
-  expect(ent.headers.get("X-Product")).toBe("SaaS")
+  expect(ent.headers.get("X-Product")).toBe("Cloud-Hosted")
   expect(ent.headers.get("User-Agent")).toBe("WorkBuddy/5.5.6")
   // the SaaS summary isn't asked: the self-hosted server has none
   expect(calls.some((c) => c.url.pathname === "/billing/meter/get-user-resource-summary")).toBe(false)

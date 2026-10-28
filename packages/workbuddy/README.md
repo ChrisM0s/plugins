@@ -88,7 +88,17 @@ enterprise named in the body) — the one WorkBuddy's usage page reads for a
 team account, the same answer its own fields give (`credit`, `limitNum`,
 the cycle's times); a server that serves none shows an error there and
 nothing else is affected. The models are the server's `/v3/config` when it
-serves one, else the China build's list.
+serves one, else the enterprise build's own list (`ENTERPRISE_MODELS`: its
+ids are the enterprise's — `kimi-k3`, not the China build's `kimi-k3-1`).
+
+`X-Product` is `Cloud-Hosted` on an enterprise account's requests, not the
+`SaaS` the other builds send (since 0.2.2). Measured 2026-10-28 against
+`h3c.copilot.qq.com`: its `/v3/config` answers the full `agents` and
+`models` only to `Cloud-Hosted` — `SaaS` and no `X-Product` at all answer
+`enterpriseId` and `productFeatures` alone, so the model list fell back to
+the China build's and `kimi-k3-1` was refused with code 11102, "model
+[kimi-k3-1] service info not found". Its own client (CodeBuddy's
+`h3caiwork` build) sends `Cloud-Hosted` on its chats too.
 
 Desktop's sign-in is refreshed only when the app hasn't refreshed it
 itself, and the new token is kept in memory, never written back, as magpie's

@@ -40,6 +40,32 @@ const CN_MODELS = [
   ["deepseek-v4-pro", "Deepseek-V4-Pro", 1000000, ["none", "high", "xhigh"]],
 ]
 
+// ENTERPRISE_MODELS is the enterprise build's own list, the ids its
+// self-hosted servers answer — measured 2026-10-28 against
+// h3c.copilot.qq.com's /v3/config (with X-Product "Cloud-Hosted"): no
+// kimi-k3-1 as the China build has, but kimi-k3, hy4-preview,
+// deepseek-v4-pro-exclusive and minimax-m2.7 of its own. This list is the
+// fallback when a server's config can't be read; the live list, when it
+// can, is what the account's models are.
+const ENTERPRISE_MODELS = [
+  ["auto", "Auto", 168000],
+  ["hy4-preview", "Hy4 preview", 1000000, ["high"]],
+  ["hy3", "Hy3", 192000, ["low", "high"]],
+  ["hy3-x", "Hy3-X", 192000, ["low", "high"]],
+  ["deepseek-v4.1-flash", "Deepseek-V4.1-Flash", 1000000],
+  ["deepseek-v4-pro-exclusive", "Deepseek-V4-Pro", 1000000, ["none", "high", "xhigh"]],
+  ["glm-5.3", "GLM-5.3", 1000000, ["low", "high", "max"]],
+  ["glm-5.3-flash", "GLM-5.3-Flash", 1000000, ["low", "high", "max"]],
+  ["glm-5.2", "GLM-5.2", 1000000, ["high", "xhigh"]],
+  ["glm-5.1", "GLM-5.1", 200000],
+  ["glm-5v-turbo", "GLM-5v-Turbo", 200000],
+  ["minimax-m3", "MiniMax-M3", 512000],
+  ["minimax-m2.7", "MiniMax-M2.7", 200000],
+  ["kimi-k3", "Kimi-K3", 1000000, ["low", "high", "xhigh"]],
+  ["kimi-k2.7", "Kimi-K2.7-Code", 256000],
+  ["kimi-k2.6", "Kimi-K2.6", 256000],
+]
+
 const AI_MODELS = [
   ["default-model", "Default", 176000],
   ["fast-model", "Fast", 200000],
@@ -92,7 +118,8 @@ const SITES = {
   // is empty). An experiment: WorkBuddy's own client headers, everywhere —
   // browserSignIn's flow and sign/renew/meter as they stand — against that
   // server, only the address differing. Its models are read from its own
-  // /v3/config when it serves one, else the China build's list.
+  // /v3/config when it serves one, else the enterprise list below (its ids
+  // are the enterprise's own, not the China build's: no kimi-k3-1 there).
   "workbuddy-enterprise": {
     id: "workbuddy-enterprise",
     name: "WorkBuddy Enterprise",
@@ -100,7 +127,7 @@ const SITES = {
     authID: "workbuddy-desktop",
     platform: "VSCode",
     ai: false,
-    models: CN_MODELS,
+    models: ENTERPRISE_MODELS,
     selfHosted: true,
   },
 }
@@ -342,7 +369,12 @@ function sign(site, a, headers) {
     headers.delete("X-API-Key")
     headers.set("X-Domain", domainOf(site, a))
   }
-  headers.set("X-Product", "SaaS")
+  // the enterprise server's config answers its full agents and models only
+  // to "Cloud-Hosted" — measured 2026-10-28 against h3c.copilot.qq.com,
+  // which serves enterpriseId and productFeatures alone to "SaaS" or no
+  // X-Product at all — and its own client (CodeBuddy's h3caiwork build)
+  // sends "Cloud-Hosted" on its chats too
+  headers.set("X-Product", site.selfHosted ? "Cloud-Hosted" : "SaaS")
   headers.set("X-IDE-Type", "WorkBuddy")
   headers.set("User-Agent", "WorkBuddy/" + UA_VERSION)
   headers.set("X-Requested-With", "XMLHttpRequest")
@@ -1474,7 +1506,8 @@ function meterAsked(site, a, path, body = {}, signal = AbortSignal.timeout(20000
   return fetch(siteFor(site, a).endpoint + path, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "WorkBuddy/" + UA_VERSION,
-      Authorization: "Bearer " + a.access, "X-User-Id": a.uid ?? "", "X-Domain": domainOf(site, a), "X-Product": "SaaS",
+      Authorization: "Bearer " + a.access, "X-User-Id": a.uid ?? "", "X-Domain": domainOf(site, a),
+      "X-Product": site.selfHosted ? "Cloud-Hosted" : "SaaS",
       "X-IDE-Type": "WorkBuddy", ...enterpriseHeaders(a) },
     body: JSON.stringify(body),
     signal,
